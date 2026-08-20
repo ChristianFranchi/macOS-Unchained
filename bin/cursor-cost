@@ -1,0 +1,106 @@
+#!/bin/bash
+# macOS Unchained — cursor-cost
+# Misura quanto costa la colorazione del cursore di Accessibilita'.
+# Non installa nulla, non richiede privilegi, ripristina sempre lo stato iniziale.
+set -u
+DOM=com.apple.universalaccess
+PLIST="$HOME/Library/Preferences/$DOM.plist"
+BK="${TMPDIR:-/tmp}/unchained-ua-$(date +%Y%m%d-%H%M%S).plist"
+WATCH_DEFAULT='Hammerspoon|Bartender|WindowServer|SystemUIServer|iStat|Stats|LuLu|Alfred|Raycast'
+WATCH="${UNCHAINED_WATCH:-$WATCH_DEFAULT}"
+SETTLE="${UNCHAINED_SETTLE:-45}"
+
+say() { printf '%s\n' "$*"; }
+die() { printf '\033[31m%s\033[0m\n' "$*" >&2; exit 1; }
+
+command -v defaults >/dev/null || die "defaults non disponibile"
+[ "$(uname)" = "Darwin" ] || die "solo macOS"
+
+# --- stato iniziale -----------------------------------------------------------
+CUSTOM=$(defaults read "$DOM" cursorIsCustomized 2>/dev/null || echo 0)
+if [ "$CUSTOM" != "1" ]; then
+  say "La colorazione del cursore non e' attiva: non c'e' niente da misurare."
+  say "Attivala da Impostazioni > Accessibilita' > Monitor > Puntatore, poi rilancia."
+  exit 0
+fi
+
+defaults export "$DOM" "$BK" || die "backup fallito"
+say "Backup dello stato in: $BK"
+say ""
+
+restore() {
+  defaults import "$DOM" "$BK" 2>/dev/null
+  say ""
+  say "Stato ripristinato dal backup."
+}
+trap restore EXIT INT TERM
+
+# --- misura -------------------------------------------------------------------
+# top -l 3 e non ps: su processi longevi ps riporta una media smorzata,
+# che nei confronti prima/dopo puo' muoversi al contrario.
+misura() {
+  /usr/bin/python3 - "$WATCH" <<'PY'
+import subprocess, re, sys, collections
+pat = re.compile(sys.argv[1], re.I)
+acc = collections.defaultdict(list)
+for _ in range(3):
+    out = subprocess.run(['top','-l','2','-n','60','-o','cpu','-stats','cpu,command'],
+                         capture_output=True, text=True).stdout
+    body = out.rsplit('CPU', 1)[-1]
+    for line in body.splitlines():
+        m = re.match(r'\s*([\d.]+)\s+(\S.*?)\s*$', line)
+        if m and pat.search(m.group(2)):
+            acc[m.group(2).strip()].append(float(m.group(1)))
+for name in sorted(acc, key=lambda k: -sum(acc[k])/len(acc[k])):
+    v = acc[name]
+    print(f"{name}\t{sum(v)/len(v):.1f}")
+PY
+}
+
+say "① misura con la colorazione ATTIVA…"
+A=$(misura)
+printf '%s\n' "$A" | awk -F'\t' '{printf "    %-24s %6.1f%%\n",$1,$2}'
+
+say ""
+say "② disattivo la colorazione e attendo ${SETTLE}s…"
+defaults delete "$DOM" cursorOutline 2>/dev/null
+defaults delete "$DOM" cursorFill 2>/dev/null
+defaults write  "$DOM" cursorIsCustomized -bool false
+sleep "$SETTLE"
+
+B=$(misura)
+printf '%s\n' "$B" | awk -F'\t' '{printf "    %-24s %6.1f%%\n",$1,$2}'
+
+# --- verdetto -----------------------------------------------------------------
+say ""
+printf '%s\n---\n%s\n' "$A" "$B" | /usr/bin/python3 -c '
+import sys
+a, b = sys.stdin.read().split("---")
+def parse(t):
+    d = {}
+    for l in t.strip().splitlines():
+        if "\t" in l:
+            k, v = l.split("\t"); d[k.strip()] = float(v)
+    return d
+A, B = parse(a), parse(b)
+tot = 0.0
+righe = []
+for k in A:
+    if k in B:
+        d = A[k] - B[k]
+        tot += d
+        if abs(d) >= 3:
+            righe.append((d, k, A[k], B[k]))
+righe.sort(reverse=True)
+for d, k, x, y in righe:
+    print(f"    {k:<24} {x:6.1f}%  ->{y:6.1f}%   {d:+.1f}")
+print()
+if tot >= 20:
+    print(f"  VERDETTO: la colorazione del cursore ti costa ~{tot:.0f} punti di CPU, in continuo.")
+    print("  Toglila da Impostazioni > Accessibilita > Monitor > Puntatore (la DIMENSIONE puoi tenerla).")
+elif tot >= 5:
+    print(f"  VERDETTO: costo modesto (~{tot:.0f} punti). Dipende da quali app tieni aperte.")
+else:
+    print("  VERDETTO: nessun costo apprezzabile ora.")
+    print("  Nota: il costo sembra crescere con l uptime — riprova dopo qualche giorno di accensione.")
+'
